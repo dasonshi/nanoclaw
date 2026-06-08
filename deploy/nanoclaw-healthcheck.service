@@ -1,0 +1,12 @@
+[Unit]
+Description=NanoClaw Telegram polling health check
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/nanoclaw/.env
+ExecStart=/usr/local/bin/nanoclaw-healthcheck
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanoclaw-healthcheck
