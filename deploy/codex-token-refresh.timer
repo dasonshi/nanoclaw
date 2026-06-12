@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Codex OAuth token refresh (keeps the rotating refresh_token alive)
+
+[Timer]
+# Daily — well inside the ~10-day window in which an unused refresh_token goes
+# stale, so the token never reaches the dead state. Persistent catches up after
+# downtime; the randomized delay avoids hitting the auth endpoint at a fixed second.
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
