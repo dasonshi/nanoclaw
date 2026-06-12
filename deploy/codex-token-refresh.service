@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=nanoclaw
+# Secret token files: create everything (tmp, .bak) owner-only from the start,
+# closing the brief window before the script's explicit chmod 0600.
+UMask=0077
 # Loaded as root before dropping to User=nanoclaw, so TELEGRAM_BOT_TOKEN /
 # OPS_NOTIFY_JID are available to the failure-alert path. Optional (leading -).
 EnvironmentFile=-/opt/nanoclaw/.env

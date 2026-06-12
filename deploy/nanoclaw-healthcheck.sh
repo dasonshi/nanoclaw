@@ -99,7 +99,8 @@ PY
       if [[ -r "${CODEX_TS_FILE}" ]]; then LAST=$(cat "${CODEX_TS_FILE}"); LAST=${LAST:-0}; fi
       # Throttle to one alert per hour, matching the in-app escalation notifier.
       if (( NOW - LAST >= 3600 )); then
-        CHAT_ID=${OPS_NOTIFY_JID#tg:}
+        CHAT_ID=${OPS_NOTIFY_JID:-}   # default-empty: script runs under `set -u`
+        CHAT_ID=${CHAT_ID#tg:}
         if [[ -n "${TOKEN}" && -n "${CHAT_ID}" ]]; then
           MSG="⚠️ NanoClaw: Codex OAuth token invalidated (HTTP 401). OpenAI runner is failing over to Claude — Anthropic credit is being spent. Re-auth on the VPS: sudo -u nanoclaw codex login --device-auth"
           curl -sS --max-time 10 "https://api.telegram.org/bot${TOKEN}/sendMessage" \
