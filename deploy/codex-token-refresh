@@ -110,6 +110,7 @@ def main():
 
     before_exp = jwt_exp(tokens.get("access_token", ""))
     shutil.copy(AUTH, AUTH + ".bak")
+    os.chmod(AUTH + ".bak", 0o600)  # backup holds the old token — keep it owner-only
 
     try:
         req = urllib.request.Request(
@@ -155,7 +156,9 @@ def main():
     auth["tokens"] = new_tokens
     auth["last_refresh"] = datetime.now(timezone.utc).isoformat()
     tmp = AUTH + ".tmp"
-    json.dump(auth, open(tmp, "w"), indent=2)
+    with open(tmp, "w") as f:
+        json.dump(auth, f, indent=2)
+    os.chmod(tmp, 0o600)  # secret token file must stay owner-only (umask is 0002)
     os.replace(tmp, AUTH)
 
     after_exp = jwt_exp(new_tokens["access_token"])
