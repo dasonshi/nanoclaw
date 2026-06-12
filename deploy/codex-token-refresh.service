@@ -1,0 +1,15 @@
+[Unit]
+Description=Proactively refresh Codex OAuth token (keep refresh_token rotating)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nanoclaw
+# Loaded as root before dropping to User=nanoclaw, so TELEGRAM_BOT_TOKEN /
+# OPS_NOTIFY_JID are available to the failure-alert path. Optional (leading -).
+EnvironmentFile=-/opt/nanoclaw/.env
+ExecStart=/usr/local/bin/codex-token-refresh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codex-token-refresh

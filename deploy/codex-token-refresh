@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Proactively refresh the Codex (ChatGPT) OAuth token.
+
+Run on a daily timer (codex-token-refresh.timer). The Codex access token lives
+~10 days and the runner only refreshes it in the final 5 minutes before expiry
+(container/openai-runner). By then the rotating refresh_token has gone stale
+from disuse, the refresh 401s, and a human must re-run `codex login
+--device-auth` (observed 2026-06-02 and 2026-06-12, ~10 days apart).
+
+Refreshing every day exercises the refresh_token while it is still valid, so it
+keeps rotating and never reaches the dead state — eliminating the manual chore.
+
+Safety: backs up auth.json, writes atomically, restores the backup if the new
+token doesn't actually authenticate, and sends a Telegram alert (to
+OPS_NOTIFY_JID) if a refresh fails — so a broken chain is caught BEFORE the
+token expires, not after.
+"""
+import base64
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+AUTH = os.environ.get("CODEX_AUTH_PATH", "/home/nanoclaw/.codex/auth.json")
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI public OAuth client (matches id_token aud)
+TOKEN_URL = "https://auth.openai.com/oauth/token"
+RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def jwt_exp(tok):
+    try:
+        p = tok.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return json.loads(base64.urlsafe_b64decode(p)).get("exp")
+    except Exception:
+        return None
+
+
+def telegram_alert(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    jid = os.environ.get("OPS_NOTIFY_JID", "")
+    chat = jid.split(":", 1)[1] if jid.startswith("tg:") else jid
+    if not token or not chat:
+        log("(no TELEGRAM_BOT_TOKEN/OPS_NOTIFY_JID — skipping alert)")
+        return
+    try:
+        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage", data=data
+            ),
+            timeout=10,
+        )
+    except Exception as e:
+        log(f"(alert send failed: {e})")
+
+
+def responses_ok(tokens):
+    """Probe the live Responses endpoint. 401 => token dead; anything else => auth accepted."""
+    try:
+        req = urllib.request.Request(
+            RESPONSES_URL,
+            data=json.dumps(
+                {
+                    "model": "gpt-5.5",
+                    "stream": True,
+                    "store": False,
+                    "input": [
+                        {"role": "user", "content": [{"type": "input_text", "text": "ping"}]}
+                    ],
+                }
+            ).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {tokens['access_token']}",
+                "chatgpt-account-id": tokens.get("account_id", ""),
+                "OpenAI-Beta": "responses=experimental",
+                "originator": "codex_cli_rs",
+                "Content-Type": "application/json",
+            },
+        )
+        urllib.request.urlopen(req, timeout=20)
+        return True
+    except urllib.error.HTTPError as e:
+        return e.code != 401
+    except Exception:
+        # Network blip — don't treat as auth failure.
+        return True
+
+
+def main():
+    if not os.path.exists(AUTH):
+        log(f"No auth.json at {AUTH} — nothing to refresh (OpenAI runner may be using an API key).")
+        return 0
+
+    auth = json.load(open(AUTH))
+    tokens = auth.get("tokens") or {}
+    rt = tokens.get("refresh_token")
+    if not rt:
+        log("No refresh_token present — skipping.")
+        return 0
+
+    before_exp = jwt_exp(tokens.get("access_token", ""))
+    shutil.copy(AUTH, AUTH + ".bak")
+
+    try:
+        req = urllib.request.Request(
+            TOKEN_URL,
+            data=json.dumps(
+                {"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": rt}
+            ).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        resp = json.load(urllib.request.urlopen(req, timeout=30))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        log(f"REFRESH FAILED: HTTP {e.code} {body}")
+        telegram_alert(
+            "⚠️ NanoClaw: Codex proactive token refresh FAILED "
+            f"(HTTP {e.code}). The token will expire and the runner will fall "
+            "back to Claude. Re-auth soon: sudo -u nanoclaw codex login --device-auth"
+        )
+        return 1
+    except Exception as e:
+        log(f"REFRESH ERROR (transient?): {e}")
+        return 1  # timer retries next cycle; transient network issues are fine
+
+    new_tokens = {
+        "id_token": resp.get("id_token", tokens.get("id_token")),
+        "access_token": resp.get("access_token", tokens["access_token"]),
+        "refresh_token": resp.get("refresh_token", tokens["refresh_token"]),
+        "account_id": tokens.get("account_id"),
+    }
+
+    # Verify the new token actually authenticates before committing.
+    if not responses_ok(new_tokens):
+        log("New access token failed the live probe (401) — restoring backup.")
+        shutil.copy(AUTH + ".bak", AUTH)
+        telegram_alert(
+            "⚠️ NanoClaw: Codex refresh returned a token that still 401s — "
+            "kept the old one. Manual re-auth likely needed: "
+            "sudo -u nanoclaw codex login --device-auth"
+        )
+        return 1
+
+    auth["tokens"] = new_tokens
+    auth["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    tmp = AUTH + ".tmp"
+    json.dump(auth, open(tmp, "w"), indent=2)
+    os.replace(tmp, AUTH)
+
+    after_exp = jwt_exp(new_tokens["access_token"])
+    rotated = new_tokens["refresh_token"] != rt
+    fmt = lambda x: datetime.fromtimestamp(x, timezone.utc).isoformat() if x else "?"
+    log(
+        f"Codex token refreshed. access_token exp {fmt(before_exp)} -> {fmt(after_exp)} "
+        f"| refresh_token rotated: {rotated}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
