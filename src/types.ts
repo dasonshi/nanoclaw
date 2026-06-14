@@ -25,11 +25,23 @@ export interface AllowedRoot {
   allowReadWrite: boolean;
   // Optional description for documentation
   description?: string;
+  // Lift specific DEFAULT_BLOCKED_PATTERNS for paths under this root only.
+  // User-defined blockedPatterns still apply unconditionally. This is the
+  // narrow escape hatch needed to mount things like an SSH deploy key
+  // (default-blocked by ".ssh" / "id_ed25519" patterns) without weakening
+  // the global block for all other roots.
+  bypassDefaultBlocks?: string[];
 }
 
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  // Optional per-group env overrides for the runner container. Keys must
+  // match the allowlist regex enforced in container-runner.ts (currently
+  // ^(OPENAI|ROUTEAWARE|HYLO)_) — this is the gate that lets each group raise
+  // its own MAX_TURNS or set ROUTEAWARE_REPO/HYLO_SUPABASE_SERVICE_ROLE
+  // without becoming a generic env-injection surface for any IPC caller.
+  env?: Record<string, string>;
 }
 
 export interface RegisteredGroup {
@@ -38,8 +50,17 @@ export interface RegisteredGroup {
   trigger: string;
   added_at: string;
   containerConfig?: ContainerConfig;
-  requiresTrigger?: boolean; // Default: true for groups, false for solo chats
+  requiresTrigger?: boolean; // Default: false (responds to every message); set true to require the @<name> trigger
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  status?: 'active' | 'paused' | 'suspended'; // Default: 'active'
+  // Folders this group can schedule tasks INTO via IPC schedule_task. Used
+  // when a non-main group needs to hand work off to a paired synthetic group
+  // (e.g. routeaware_standup → routeaware_implementer_exec for the implementer
+  // phase, where the exec group holds the deploy-key mount and the standup
+  // group does not). Set at registration time by main; cannot be modified by
+  // the group itself. Empty/undefined preserves the default "non-main can
+  // only schedule for self" behavior.
+  allowedTargets?: string[];
 }
 
 export interface NewMessage {

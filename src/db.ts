@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -80,8 +81,44 @@ function createSchema(database: Database.Database): void {
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
       container_config TEXT,
-      requires_trigger INTEGER DEFAULT 1
+      requires_trigger INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS onboarding_sessions (
+      chat_jid TEXT PRIMARY KEY,
+      sender_name TEXT,
+      state TEXT NOT NULL DEFAULT 'welcome',
+      business_name TEXT,
+      location_id TEXT,
+      pit_token TEXT,
+      description TEXT,
+      bot_name TEXT DEFAULT 'HyloClaw',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS customer_locations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_jid TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      business_name TEXT NOT NULL,
+      location_id TEXT NOT NULL,
+      description TEXT NOT NULL,
+      bot_name TEXT NOT NULL DEFAULT 'HyloClaw',
+      bridge_token TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      is_active INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      UNIQUE(chat_jid, location_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_customer_locations_jid ON customer_locations(chat_jid);
+
+    CREATE TABLE IF NOT EXISTS customer_credentials (
+      chat_jid TEXT PRIMARY KEY,
+      anthropic_api_key TEXT,
+      proxy_token TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_token ON customer_credentials(proxy_token);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -114,6 +151,37 @@ function createSchema(database: Database.Database): void {
     // Backfill: existing rows with folder = 'main' are the main group
     database.exec(
       `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add status column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN status TEXT DEFAULT 'active'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add allowed_targets column (JSON-encoded string[] of folder names a
+  // non-main group is permitted to schedule IPC tasks into; see ipc.ts).
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN allowed_targets TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add last_used column to sessions for the 72h rolling-reset behavior.
+  // Existing rows are treated as fresh on first read (backfilled to now), so
+  // turning this on doesn't wipe everyone's session simultaneously.
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN last_used TEXT`);
+    database.exec(
+      `UPDATE sessions SET last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE last_used IS NULL`,
     );
   } catch {
     /* column already exists */
@@ -513,25 +581,59 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
+// Sessions are pruned after 72h of inactivity. The intent: chat continuity
+// stays useful for active conversations but doesn't grow context unbounded
+// over weeks of mixed scheduled-task + chat use. Tunable via env if needed.
+const SESSION_TTL_MS =
+  Number(process.env.NANOCLAW_SESSION_TTL_MS) || 72 * 60 * 60 * 1000;
+
+function isStale(lastUsed: string | null | undefined): boolean {
+  if (!lastUsed) return false; // pre-migration rows are treated as fresh
+  const ts = Date.parse(lastUsed);
+  if (Number.isNaN(ts)) return false;
+  return Date.now() - ts > SESSION_TTL_MS;
+}
+
 export function getSession(groupFolder: string): string | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
+    .prepare(
+      'SELECT session_id, last_used FROM sessions WHERE group_folder = ?',
+    )
+    .get(groupFolder) as
+    | { session_id: string; last_used: string | null }
+    | undefined;
+  if (!row) return undefined;
+  if (isStale(row.last_used)) {
+    // Idle past TTL — drop the session so the next invocation starts fresh.
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+    return undefined;
+  }
+  return row.session_id;
 }
 
 export function setSession(groupFolder: string, sessionId: string): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    `INSERT OR REPLACE INTO sessions (group_folder, session_id, last_used)
+     VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
   ).run(groupFolder, sessionId);
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
+    .prepare('SELECT group_folder, session_id, last_used FROM sessions')
+    .all() as Array<{
+    group_folder: string;
+    session_id: string;
+    last_used: string | null;
+  }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
+    if (isStale(row.last_used)) {
+      db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(
+        row.group_folder,
+      );
+      continue;
+    }
     result[row.group_folder] = row.session_id;
   }
   return result;
@@ -554,6 +656,8 @@ export function getRegisteredGroup(
         container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
+        status: string | null;
+        allowed_targets: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -576,6 +680,10 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    status: (row.status as RegisteredGroup['status']) || 'active',
+    allowedTargets: row.allowed_targets
+      ? JSON.parse(row.allowed_targets)
+      : undefined,
   };
 }
 
@@ -584,8 +692,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, status, allowed_targets)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -593,9 +701,22 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.trigger,
     group.added_at,
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.requiresTrigger === undefined ? 0 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
+    group.status || 'active',
+    group.allowedTargets ? JSON.stringify(group.allowedTargets) : null,
   );
+}
+
+export function setGroupStatus(jid: string, status: string): void {
+  db.prepare('UPDATE registered_groups SET status = ? WHERE jid = ?').run(
+    status,
+    jid,
+  );
+}
+
+export function deleteRegisteredGroup(jid: string): void {
+  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
@@ -608,6 +729,8 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
+    status: string | null;
+    allowed_targets: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -629,9 +752,280 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,
+      status: (row.status as RegisteredGroup['status']) || 'active',
+      allowedTargets: row.allowed_targets
+        ? JSON.parse(row.allowed_targets)
+        : undefined,
     };
   }
   return result;
+}
+
+// --- Onboarding session accessors ---
+
+export interface OnboardingSession {
+  chat_jid: string;
+  sender_name: string | null;
+  state: string;
+  business_name: string | null;
+  location_id: string | null;
+  pit_token: string | null;
+  description: string | null;
+  bot_name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function getOnboardingSession(
+  chatJid: string,
+): OnboardingSession | undefined {
+  return db
+    .prepare('SELECT * FROM onboarding_sessions WHERE chat_jid = ?')
+    .get(chatJid) as OnboardingSession | undefined;
+}
+
+export function upsertOnboardingSession(
+  session: Partial<OnboardingSession> & { chat_jid: string },
+): void {
+  const existing = getOnboardingSession(session.chat_jid);
+  const now = new Date().toISOString();
+  if (existing) {
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    if (session.state !== undefined) {
+      fields.push('state = ?');
+      values.push(session.state);
+    }
+    if (session.sender_name !== undefined) {
+      fields.push('sender_name = ?');
+      values.push(session.sender_name);
+    }
+    if (session.business_name !== undefined) {
+      fields.push('business_name = ?');
+      values.push(session.business_name);
+    }
+    if (session.location_id !== undefined) {
+      fields.push('location_id = ?');
+      values.push(session.location_id);
+    }
+    if (session.pit_token !== undefined) {
+      fields.push('pit_token = ?');
+      values.push(session.pit_token);
+    }
+    if (session.description !== undefined) {
+      fields.push('description = ?');
+      values.push(session.description);
+    }
+    if (session.bot_name !== undefined) {
+      fields.push('bot_name = ?');
+      values.push(session.bot_name);
+    }
+    fields.push('updated_at = ?');
+    values.push(now);
+    values.push(session.chat_jid);
+    db.prepare(
+      `UPDATE onboarding_sessions SET ${fields.join(', ')} WHERE chat_jid = ?`,
+    ).run(...values);
+  } else {
+    db.prepare(
+      `INSERT INTO onboarding_sessions (chat_jid, sender_name, state, business_name, location_id, pit_token, description, bot_name, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      session.chat_jid,
+      session.sender_name || null,
+      session.state || 'welcome',
+      session.business_name || null,
+      session.location_id || null,
+      session.pit_token || null,
+      session.description || null,
+      session.bot_name || 'HyloClaw',
+      now,
+      now,
+    );
+  }
+}
+
+export function deleteOnboardingSession(chatJid: string): void {
+  db.prepare('DELETE FROM onboarding_sessions WHERE chat_jid = ?').run(chatJid);
+}
+
+export function cleanupStaleOnboardingSessions(maxAgeMs: number): number {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const result = db
+    .prepare('DELETE FROM onboarding_sessions WHERE updated_at <= ?')
+    .run(cutoff);
+  return result.changes;
+}
+
+// --- Customer location accessors ---
+
+export interface CustomerLocation {
+  id: number;
+  chat_jid: string;
+  slug: string;
+  business_name: string;
+  location_id: string;
+  description: string;
+  bot_name: string;
+  bridge_token: string;
+  group_folder: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+interface CustomerLocationRow {
+  id: number;
+  chat_jid: string;
+  slug: string;
+  business_name: string;
+  location_id: string;
+  description: string;
+  bot_name: string;
+  bridge_token: string;
+  group_folder: string;
+  is_active: number;
+  created_at: string;
+}
+
+function rowToLocation(row: CustomerLocationRow): CustomerLocation {
+  return { ...row, is_active: row.is_active === 1 };
+}
+
+export function addCustomerLocation(
+  loc: Omit<CustomerLocation, 'id' | 'is_active' | 'created_at'> & {
+    is_active?: boolean;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO customer_locations (chat_jid, slug, business_name, location_id, description, bot_name, bridge_token, group_folder, is_active, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    loc.chat_jid,
+    loc.slug,
+    loc.business_name,
+    loc.location_id,
+    loc.description,
+    loc.bot_name,
+    loc.bridge_token,
+    loc.group_folder,
+    loc.is_active ? 1 : 0,
+    new Date().toISOString(),
+  );
+}
+
+export function getCustomerLocations(chatJid: string): CustomerLocation[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM customer_locations WHERE chat_jid = ? ORDER BY created_at',
+    )
+    .all(chatJid) as CustomerLocationRow[];
+  return rows.map(rowToLocation);
+}
+
+export function getActiveCustomerLocation(
+  chatJid: string,
+): CustomerLocation | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM customer_locations WHERE chat_jid = ? AND is_active = 1',
+    )
+    .get(chatJid) as CustomerLocationRow | undefined;
+  return row ? rowToLocation(row) : undefined;
+}
+
+export function setActiveCustomerLocation(
+  chatJid: string,
+  locationId: string,
+): void {
+  db.prepare(
+    'UPDATE customer_locations SET is_active = 0 WHERE chat_jid = ?',
+  ).run(chatJid);
+  db.prepare(
+    'UPDATE customer_locations SET is_active = 1 WHERE chat_jid = ? AND location_id = ?',
+  ).run(chatJid, locationId);
+}
+
+export function removeCustomerLocation(
+  chatJid: string,
+  locationId: string,
+): void {
+  db.prepare(
+    'DELETE FROM customer_locations WHERE chat_jid = ? AND location_id = ?',
+  ).run(chatJid, locationId);
+}
+
+export function updateLocationBridgeToken(
+  chatJid: string,
+  locationId: string,
+  bridgeToken: string,
+): void {
+  db.prepare(
+    'UPDATE customer_locations SET bridge_token = ? WHERE chat_jid = ? AND location_id = ?',
+  ).run(bridgeToken, chatJid, locationId);
+}
+
+export function getCustomerLocationCount(chatJid: string): number {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as count FROM customer_locations WHERE chat_jid = ?',
+    )
+    .get(chatJid) as { count: number };
+  return row.count;
+}
+
+// --- Customer credentials accessors ---
+
+export interface CustomerCredential {
+  chat_jid: string;
+  anthropic_api_key: string | null;
+  proxy_token: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function getCustomerCredential(
+  chatJid: string,
+): CustomerCredential | undefined {
+  return db
+    .prepare('SELECT * FROM customer_credentials WHERE chat_jid = ?')
+    .get(chatJid) as CustomerCredential | undefined;
+}
+
+export function upsertCustomerCredential(
+  chatJid: string,
+  apiKey: string,
+): CustomerCredential {
+  const now = new Date().toISOString();
+  const existing = getCustomerCredential(chatJid);
+  if (existing) {
+    db.prepare(
+      'UPDATE customer_credentials SET anthropic_api_key = ?, updated_at = ? WHERE chat_jid = ?',
+    ).run(apiKey, now, chatJid);
+    return { ...existing, anthropic_api_key: apiKey, updated_at: now };
+  }
+  const proxyToken = crypto.randomBytes(24).toString('hex');
+  db.prepare(
+    'INSERT INTO customer_credentials (chat_jid, anthropic_api_key, proxy_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+  ).run(chatJid, apiKey, proxyToken, now, now);
+  return {
+    chat_jid: chatJid,
+    anthropic_api_key: apiKey,
+    proxy_token: proxyToken,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+export function deleteCustomerCredential(chatJid: string): void {
+  db.prepare('DELETE FROM customer_credentials WHERE chat_jid = ?').run(
+    chatJid,
+  );
+}
+
+export function getAllCustomerCredentials(): CustomerCredential[] {
+  return db
+    .prepare('SELECT * FROM customer_credentials')
+    .all() as CustomerCredential[];
 }
 
 // --- JSON migration ---
