@@ -1,7 +1,9 @@
+import fs from 'fs';
 import https from 'https';
+import path from 'path';
 import { Api, Bot } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -16,6 +18,14 @@ export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onOnboardingStart?: (chatJid: string, senderName: string) => void;
+  onOnboardingMessage?: (
+    chatJid: string,
+    text: string,
+    senderName: string,
+  ) => void;
+  onCommand?: (chatJid: string, command: string) => void;
+  isInCommandFlow?: (chatJid: string) => boolean;
 }
 
 /**
@@ -47,6 +57,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private pausedNotifyTimestamps = new Map<string, number>();
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -79,6 +90,33 @@ export class TelegramChannel implements Channel {
     this.bot.command('ping', (ctx) => {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
+
+    // Onboarding: /start command in private chats
+    this.bot.command('start', (ctx) => {
+      if (ctx.chat.type === 'private') {
+        const senderName = ctx.from?.first_name || 'there';
+        this.opts.onOnboardingStart?.(`tg:${ctx.chat.id}`, senderName);
+      }
+    });
+
+    // Multi-location bot commands (private chats only)
+    const privateCommands = [
+      'locations',
+      'connect',
+      'reconnect',
+      'disconnect',
+      'pause',
+      'resume',
+      'help',
+      'apikey',
+    ];
+    for (const cmd of privateCommands) {
+      this.bot.command(cmd, (ctx) => {
+        if (ctx.chat.type === 'private') {
+          this.opts.onCommand?.(`tg:${ctx.chat.id}`, cmd);
+        }
+      });
+    }
 
     this.bot.on('message:text', async (ctx) => {
       // Skip commands
@@ -134,11 +172,62 @@ export class TelegramChannel implements Channel {
 
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
+
+      // Private DM from registered user in a command flow (e.g. mid-/connect)
+      // Route to onboarding handler instead of AI
+      if (
+        group &&
+        ctx.chat.type === 'private' &&
+        this.opts.isInCommandFlow?.(chatJid)
+      ) {
+        this.opts.onOnboardingMessage?.(chatJid, content, senderName);
+        return;
+      }
+
       if (!group) {
-        logger.debug(
-          { chatJid, chatName },
-          'Message from unregistered Telegram chat',
-        );
+        // Route private DMs from unregistered users to onboarding
+        if (ctx.chat.type === 'private') {
+          this.opts.onOnboardingMessage?.(chatJid, content, senderName);
+        } else {
+          logger.debug(
+            { chatJid, chatName },
+            'Message from unregistered Telegram chat',
+          );
+        }
+        return;
+      }
+
+      // Handle paused/suspended groups
+      if (group.status === 'paused' || group.status === 'suspended') {
+        const now = Date.now();
+        const lastNotify = this.pausedNotifyTimestamps.get(chatJid) || 0;
+        // Throttle: max once per hour per chat
+        if (now - lastNotify > 3600000) {
+          this.pausedNotifyTimestamps.set(chatJid, now);
+          const statusMsg =
+            group.status === 'suspended'
+              ? 'Your account has been suspended. Please contact support.'
+              : 'Your account is currently paused. Send "reactivate" to resume, or contact support.';
+          sendTelegramMessage(
+            this.bot!.api,
+            ctx.chat.id.toString(),
+            statusMsg,
+          ).catch((err) =>
+            logger.warn({ chatJid, err }, 'Failed to send paused notification'),
+          );
+        }
+        // Check for reactivation keyword
+        if (
+          group.status === 'paused' &&
+          content.trim().toLowerCase() === 'reactivate'
+        ) {
+          // Write self_resume IPC task
+          this.opts.onOnboardingMessage?.(
+            chatJid,
+            '__self_resume__',
+            senderName,
+          );
+        }
         return;
       }
 
@@ -158,6 +247,25 @@ export class TelegramChannel implements Channel {
         'Telegram message stored',
       );
     });
+
+    // Register bot commands for Telegram autocomplete menu
+    this.bot.api
+      .setMyCommands(
+        [
+          { command: 'locations', description: 'List & switch GHL locations' },
+          { command: 'connect', description: 'Connect a new GHL location' },
+          {
+            command: 'reconnect',
+            description: 'Update PIT token for active location',
+          },
+          { command: 'disconnect', description: 'Remove active location' },
+          { command: 'pause', description: 'Pause AI responses' },
+          { command: 'resume', description: 'Resume AI responses' },
+          { command: 'help', description: 'Show available commands' },
+        ],
+        { scope: { type: 'all_private_chats' } },
+      )
+      .catch((err) => logger.warn({ err }, 'Failed to set bot commands'));
 
     // Handle non-text messages with placeholders so the agent knows something was sent
     const storeNonText = (ctx: any, placeholder: string) => {
@@ -193,12 +301,81 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    // Download a Telegram file and save to the group's photos/ directory
+    const downloadAndSave = async (
+      fileId: string,
+      group: RegisteredGroup,
+      ext: string,
+      msgId: string,
+    ): Promise<string | null> => {
+      try {
+        const file = await this.bot!.api.getFile(fileId);
+        if (!file.file_path) return null;
+
+        const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+        const photosDir = path.join(GROUPS_DIR, group.folder, 'photos');
+        fs.mkdirSync(photosDir, { recursive: true });
+
+        const filename = `${msgId}.${ext}`;
+        const filePath = path.join(photosDir, filename);
+
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const buffer = Buffer.from(await res.arrayBuffer());
+        fs.writeFileSync(filePath, buffer);
+
+        return `/workspace/group/photos/${filename}`;
+      } catch (err) {
+        logger.warn({ fileId, err }, 'Failed to download Telegram file');
+        return null;
+      }
+    };
+
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      // Get highest resolution photo
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      const msgId = ctx.message.message_id.toString();
+
+      const savedPath = await downloadAndSave(
+        best.file_id,
+        group,
+        'jpg',
+        msgId,
+      );
+      if (savedPath) {
+        storeNonText(ctx, `[Photo saved to ${savedPath}]`);
+      } else {
+        storeNonText(ctx, '[Photo — download failed]');
+      }
+    });
+
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
       const name = ctx.message.document?.file_name || 'file';
+
+      if (group && ctx.message.document) {
+        const ext = name.includes('.') ? name.split('.').pop()! : 'bin';
+        const msgId = ctx.message.message_id.toString();
+        const savedPath = await downloadAndSave(
+          ctx.message.document.file_id,
+          group,
+          ext,
+          msgId,
+        );
+        if (savedPath) {
+          storeNonText(ctx, `[Document: ${name} saved to ${savedPath}]`);
+          return;
+        }
+      }
       storeNonText(ctx, `[Document: ${name}]`);
     });
     this.bot.on('message:sticker', (ctx) => {

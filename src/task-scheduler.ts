@@ -5,11 +5,12 @@ import fs from 'fs';
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
   ContainerOutput,
-  runContainerAgent,
+  runContainerWithFallback,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
   getAllTasks,
+  getCustomerCredential,
   getDueTasks,
   getTaskById,
   logTaskRun,
@@ -73,6 +74,8 @@ export interface SchedulerDependencies {
     groupFolder: string,
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
+  /** Notifier called when the OpenAI runner escalates to Claude. Optional. */
+  onEscalate?: (group: RegisteredGroup, reason: string) => Promise<void>;
 }
 
 async function runTask(
@@ -168,8 +171,13 @@ async function runTask(
     }, TASK_CLOSE_DELAY_MS);
   };
 
+  const credential = getCustomerCredential(task.chat_jid);
+  const proxyToken = credential?.anthropic_api_key
+    ? credential.proxy_token
+    : undefined;
+
   try {
-    const output = await runContainerAgent(
+    const output = await runContainerWithFallback(
       group,
       {
         prompt: task.prompt,
@@ -179,6 +187,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
+        proxyToken,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
@@ -197,6 +206,7 @@ async function runTask(
           error = streamedOutput.error || 'Unknown error';
         }
       },
+      deps.onEscalate ? (reason) => deps.onEscalate!(group, reason) : undefined,
     );
 
     if (closeTimer) clearTimeout(closeTimer);

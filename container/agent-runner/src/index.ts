@@ -366,11 +366,20 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+  // Load CLAUDE.md as additional system context
+  // Main: load from group folder; Non-main: load from global folder
+  let claudeMd: string | undefined;
+  if (containerInput.isMain) {
+    const groupClaudeMdPath = '/workspace/group/CLAUDE.md';
+    if (fs.existsSync(groupClaudeMdPath)) {
+      claudeMd = fs.readFileSync(groupClaudeMdPath, 'utf-8');
+      log(`Loaded group CLAUDE.md (${claudeMd.length} chars)`);
+    }
+  } else {
+    const claudeMdPath = '/workspace/global/CLAUDE.md';
+    if (fs.existsSync(claudeMdPath)) {
+      claudeMd = fs.readFileSync(claudeMdPath, 'utf-8');
+    }
   }
 
   // Discover additional directories mounted at /workspace/extra/*
@@ -396,8 +405,8 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: claudeMd
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: claudeMd }
         : undefined,
       allowedTools: [
         'Bash',
@@ -407,7 +416,10 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__hylo__*',
+        'mcp__playwright__*',
+        'mcp__ai_news__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -421,6 +433,27 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+          },
+        },
+        hylo: {
+          command: 'hylo-mcp',
+          args: [],
+          env: {
+            HYLO_API_KEY: process.env.HYLO_API_KEY || '',
+            GHL_PIT_TOKEN: process.env.GHL_PIT_TOKEN || '',
+            GHL_LOCATION_ID: process.env.GHL_LOCATION_ID || '',
+          },
+        },
+        playwright: {
+          command: 'npx',
+          args: ['@playwright/mcp@latest'],
+          env: {},
+        },
+        ai_news: {
+          command: 'node',
+          args: ['/opt/ai-news-mcp/index.js'],
+          env: {
+            AI_NEWS_DB_PATH: '/opt/ai-news-mcp/db/ai-news.db',
           },
         },
       },
@@ -440,6 +473,17 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      // Log MCP server connection status
+      const mcpServers = (message as any).mcp_servers;
+      if (Array.isArray(mcpServers)) {
+        for (const srv of mcpServers) {
+          log(`MCP server: ${srv.name} → ${srv.status}`);
+        }
+        const failed = mcpServers.filter((s: any) => s.status !== 'connected');
+        if (failed.length > 0) {
+          log(`WARNING: ${failed.length} MCP server(s) failed to connect: ${failed.map((s: any) => `${s.name}(${s.status})`).join(', ')}`);
+        }
+      }
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {

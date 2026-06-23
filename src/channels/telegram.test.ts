@@ -40,6 +40,7 @@ vi.mock('grammy', () => ({
     api = {
       sendMessage: vi.fn().mockResolvedValue(undefined),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
+      setMyCommands: vi.fn().mockResolvedValue(undefined),
     };
 
     constructor(token: string) {
@@ -541,31 +542,44 @@ describe('TelegramChannel', () => {
   // --- Non-text messages ---
 
   describe('non-text messages', () => {
-    it('stores photo with placeholder', async () => {
+    it('stores photo with placeholder on download failure', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
+      // Add photo array to ctx and mock getFile to reject
       const ctx = createMediaCtx({});
+      (ctx.message as any).photo = [
+        { file_id: 'photo1', width: 100, height: 100 },
+      ];
+      currentBot().api.getFile = vi.fn().mockRejectedValue(new Error('test'));
+
       await triggerMediaMessage('message:photo', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
-        expect.objectContaining({ content: '[Photo]' }),
+        expect.objectContaining({ content: '[Photo — download failed]' }),
       );
     });
 
-    it('stores photo with caption', async () => {
+    it('stores photo with caption on download failure', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
       const ctx = createMediaCtx({ caption: 'Look at this' });
+      (ctx.message as any).photo = [
+        { file_id: 'photo1', width: 100, height: 100 },
+      ];
+      currentBot().api.getFile = vi.fn().mockRejectedValue(new Error('test'));
+
       await triggerMediaMessage('message:photo', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
-        expect.objectContaining({ content: '[Photo] Look at this' }),
+        expect.objectContaining({
+          content: '[Photo — download failed] Look at this',
+        }),
       );
     });
 

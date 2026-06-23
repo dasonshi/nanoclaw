@@ -19,6 +19,11 @@ import { logger } from './logger.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
+export interface TokenMap {
+  get(proxyToken: string): string | undefined;
+  reload(): void;
+}
+
 export interface ProxyConfig {
   authMode: AuthMode;
 }
@@ -26,6 +31,7 @@ export interface ProxyConfig {
 export function startCredentialProxy(
   port: number,
   host = '127.0.0.1',
+  tokenMap?: TokenMap,
 ): Promise<Server> {
   const secrets = readEnvFile([
     'ANTHROPIC_API_KEY',
@@ -62,15 +68,28 @@ export function startCredentialProxy(
         delete headers['keep-alive'];
         delete headers['transfer-encoding'];
 
-        if (authMode === 'api-key') {
-          // API key mode: inject x-api-key on every request
+        // Per-customer API key: check token map first, regardless of operator auth mode.
+        // If a container sends a proxy_token that resolves to a customer's real key, use it.
+        const incoming = headers['x-api-key'] as string | undefined;
+        const customerKey =
+          incoming && incoming !== 'placeholder'
+            ? tokenMap?.get(incoming)
+            : undefined;
+
+        if (customerKey) {
+          // Customer has their own API key — inject it directly
+          delete headers['x-api-key'];
+          delete headers['authorization'];
+          headers['x-api-key'] = customerKey;
+        } else if (authMode === 'api-key') {
+          // Operator uses API key — inject global key
           delete headers['x-api-key'];
           headers['x-api-key'] = secrets.ANTHROPIC_API_KEY;
         } else {
           // OAuth mode: replace placeholder Bearer token with the real one
           // only when the container actually sends an Authorization header
-          // (exchange request + auth probes). Post-exchange requests use
-          // x-api-key only, so they pass through without token injection.
+          // (exchange request + auth probes). Post-exchange requests carry
+          // x-api-key with a real temp key from the exchange — let those through.
           if (headers['authorization']) {
             delete headers['authorization'];
             if (oauthToken) {

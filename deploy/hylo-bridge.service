@@ -1,0 +1,28 @@
+[Unit]
+Description=Hylo Bridge (GHL API Proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=nanoclaw
+WorkingDirectory=/opt/hylo-bridge
+ExecStart=/usr/bin/node server.mjs
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/hylo-bridge/.env
+Environment=NODE_ENV=production
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hylo-bridge
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/hylo-bridge /opt/nanoclaw/groups
+ProtectHome=read-only
+ReadOnlyPaths=/home/nanoclaw/.ghl
+
+[Install]
+WantedBy=multi-user.target

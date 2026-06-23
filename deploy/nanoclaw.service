@@ -1,0 +1,28 @@
+[Unit]
+Description=NanoClaw AI Agent
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=nanoclaw
+WorkingDirectory=/opt/nanoclaw
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/nanoclaw/.env
+Environment=NODE_ENV=production
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanoclaw
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/nanoclaw/store /opt/nanoclaw/data /opt/nanoclaw/groups /home/nanoclaw/.ghl
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

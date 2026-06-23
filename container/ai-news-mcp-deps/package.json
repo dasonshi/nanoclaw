@@ -1,0 +1,10 @@
+{
+  "name": "ai-news-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^9.4.3",
+    "fast-xml-parser": "^4.3.4"
+  }
+}

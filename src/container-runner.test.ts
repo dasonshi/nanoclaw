@@ -51,6 +51,11 @@ vi.mock('./mount-security.js', () => ({
   validateAdditionalMounts: vi.fn(() => []),
 }));
 
+// Mock db (getActiveCustomerLocation)
+vi.mock('./db.js', () => ({
+  getActiveCustomerLocation: vi.fn(() => undefined),
+}));
+
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {

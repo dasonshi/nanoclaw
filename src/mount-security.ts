@@ -145,15 +145,24 @@ function getRealPath(p: string): string | null {
 }
 
 /**
- * Check if a path matches any blocked pattern
+ * Check if a path matches any blocked pattern.
+ *
+ * `bypass` (optional) names individual patterns to skip. This is the narrow
+ * escape hatch for cases like mounting an SSH deploy key — the default
+ * ".ssh" / "id_ed25519" blocks would otherwise reject every key file. Bypass
+ * is granted per-AllowedRoot, never globally, so a stray mount request from
+ * outside an allowlisted root still hits the full block list.
  */
 function matchesBlockedPattern(
   realPath: string,
   blockedPatterns: string[],
+  bypass?: string[],
 ): string | null {
+  const bypassSet = new Set(bypass ?? []);
   const pathParts = realPath.split(path.sep);
 
   for (const pattern of blockedPatterns) {
+    if (bypassSet.has(pattern)) continue;
     // Check if any path component matches the pattern
     for (const part of pathParts) {
       if (part === pattern || part.includes(pattern)) {
@@ -266,19 +275,10 @@ export function validateMount(
     };
   }
 
-  // Check against blocked patterns
-  const blockedMatch = matchesBlockedPattern(
-    realPath,
-    allowlist.blockedPatterns,
-  );
-  if (blockedMatch !== null) {
-    return {
-      allowed: false,
-      reason: `Path matches blocked pattern "${blockedMatch}": "${realPath}"`,
-    };
-  }
-
-  // Check if under an allowed root
+  // Find the allowed root first so we can apply its per-root bypass list
+  // when checking blocked patterns. If no root matches, the request is
+  // rejected here — and we use the full block list (no bypass) when
+  // computing the rejection reason for outside-root paths.
   const allowedRoot = findAllowedRoot(realPath, allowlist.allowedRoots);
   if (allowedRoot === null) {
     return {
@@ -286,6 +286,19 @@ export function validateMount(
       reason: `Path "${realPath}" is not under any allowed root. Allowed roots: ${allowlist.allowedRoots
         .map((r) => expandPath(r.path))
         .join(', ')}`,
+    };
+  }
+
+  // Check against blocked patterns, honoring the root's bypass list.
+  const blockedMatch = matchesBlockedPattern(
+    realPath,
+    allowlist.blockedPatterns,
+    allowedRoot.bypassDefaultBlocks,
+  );
+  if (blockedMatch !== null) {
+    return {
+      allowed: false,
+      reason: `Path matches blocked pattern "${blockedMatch}": "${realPath}"`,
     };
   }
 

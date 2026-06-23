@@ -2,17 +2,30 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  addCustomerLocation,
+  cleanupStaleOnboardingSessions,
   createTask,
+  deleteOnboardingSession,
+  deleteRegisteredGroup,
   deleteTask,
+  getActiveCustomerLocation,
   getAllChats,
   getAllRegisteredGroups,
+  getCustomerLocationCount,
+  getCustomerLocations,
   getMessagesSince,
   getNewMessages,
+  getOnboardingSession,
   getTaskById,
+  removeCustomerLocation,
+  setActiveCustomerLocation,
+  setGroupStatus,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
+  updateLocationBridgeToken,
   updateTask,
+  upsertOnboardingSession,
 } from './db.js';
 
 beforeEach(() => {
@@ -480,5 +493,297 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- Group status ---
+
+describe('group status', () => {
+  it('defaults to active when not set', () => {
+    setRegisteredGroup('tg:123', {
+      name: 'Test',
+      folder: 'telegram_test',
+      trigger: 'always',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:123'].status).toBe('active');
+  });
+
+  it('persists status through set/get round-trip', () => {
+    setRegisteredGroup('tg:456', {
+      name: 'Paused Biz',
+      folder: 'telegram_paused-biz',
+      trigger: 'always',
+      added_at: '2024-01-01T00:00:00.000Z',
+      status: 'paused',
+    });
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:456'].status).toBe('paused');
+  });
+
+  it('setGroupStatus updates status in DB', () => {
+    setRegisteredGroup('tg:789', {
+      name: 'Active Biz',
+      folder: 'telegram_active-biz',
+      trigger: 'always',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    setGroupStatus('tg:789', 'paused');
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:789'].status).toBe('paused');
+
+    setGroupStatus('tg:789', 'active');
+    const groups2 = getAllRegisteredGroups();
+    expect(groups2['tg:789'].status).toBe('active');
+  });
+
+  it('deleteRegisteredGroup removes group from DB', () => {
+    setRegisteredGroup('tg:del', {
+      name: 'Delete Me',
+      folder: 'telegram_delete-me',
+      trigger: 'always',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    deleteRegisteredGroup('tg:del');
+    const groups = getAllRegisteredGroups();
+    expect(groups['tg:del']).toBeUndefined();
+  });
+});
+
+// --- Onboarding sessions ---
+
+describe('onboarding sessions', () => {
+  it('creates and retrieves a session', () => {
+    upsertOnboardingSession({
+      chat_jid: 'tg:100',
+      sender_name: 'Alice',
+      state: 'awaiting_name',
+    });
+
+    const session = getOnboardingSession('tg:100');
+    expect(session).toBeDefined();
+    expect(session!.state).toBe('awaiting_name');
+    expect(session!.sender_name).toBe('Alice');
+    expect(session!.bot_name).toBe('HyloClaw');
+  });
+
+  it('updates existing session fields', () => {
+    upsertOnboardingSession({
+      chat_jid: 'tg:200',
+      state: 'awaiting_name',
+    });
+
+    upsertOnboardingSession({
+      chat_jid: 'tg:200',
+      state: 'awaiting_location_id',
+      business_name: 'Acme Corp',
+    });
+
+    const session = getOnboardingSession('tg:200');
+    expect(session!.state).toBe('awaiting_location_id');
+    expect(session!.business_name).toBe('Acme Corp');
+  });
+
+  it('deletes a session', () => {
+    upsertOnboardingSession({
+      chat_jid: 'tg:300',
+      state: 'awaiting_name',
+    });
+
+    deleteOnboardingSession('tg:300');
+    expect(getOnboardingSession('tg:300')).toBeUndefined();
+  });
+
+  it('cleans up stale sessions', () => {
+    // Create a session, then set its updated_at to the past
+    upsertOnboardingSession({
+      chat_jid: 'tg:400',
+      state: 'awaiting_name',
+    });
+
+    // Manually make it stale — cleanupStaleOnboardingSessions checks updated_at
+    // Since we just created it, cleaning with maxAge=0 should delete it
+    const cleaned = cleanupStaleOnboardingSessions(0);
+    expect(cleaned).toBe(1);
+    expect(getOnboardingSession('tg:400')).toBeUndefined();
+  });
+});
+
+// --- Customer locations ---
+
+describe('customer locations', () => {
+  it('adds and retrieves locations', () => {
+    addCustomerLocation({
+      chat_jid: 'tg:100',
+      slug: 'acme',
+      business_name: 'Acme Plumbing',
+      location_id: 'loc123',
+      description: 'Plumbing company',
+      bot_name: 'HyloClaw',
+      bridge_token: 'tok1',
+      group_folder: 'telegram_acme',
+      is_active: true,
+    });
+    addCustomerLocation({
+      chat_jid: 'tg:100',
+      slug: 'acme',
+      business_name: 'Acme HVAC',
+      location_id: 'loc456',
+      description: 'HVAC division',
+      bot_name: 'HyloClaw',
+      bridge_token: 'tok2',
+      group_folder: 'telegram_acme',
+    });
+
+    const locs = getCustomerLocations('tg:100');
+    expect(locs).toHaveLength(2);
+    expect(locs[0].business_name).toBe('Acme Plumbing');
+    expect(locs[0].is_active).toBe(true);
+    expect(locs[1].business_name).toBe('Acme HVAC');
+    expect(locs[1].is_active).toBe(false);
+  });
+
+  it('gets active location', () => {
+    addCustomerLocation({
+      chat_jid: 'tg:200',
+      slug: 'biz',
+      business_name: 'Biz A',
+      location_id: 'locA',
+      description: 'A',
+      bot_name: 'Bot',
+      bridge_token: 'tokA',
+      group_folder: 'telegram_biz',
+      is_active: true,
+    });
+
+    const active = getActiveCustomerLocation('tg:200');
+    expect(active).toBeDefined();
+    expect(active!.location_id).toBe('locA');
+  });
+
+  it('switches active location', () => {
+    addCustomerLocation({
+      chat_jid: 'tg:300',
+      slug: 'multi',
+      business_name: 'Loc 1',
+      location_id: 'l1',
+      description: '1',
+      bot_name: 'Bot',
+      bridge_token: 't1',
+      group_folder: 'telegram_multi',
+      is_active: true,
+    });
+    addCustomerLocation({
+      chat_jid: 'tg:300',
+      slug: 'multi',
+      business_name: 'Loc 2',
+      location_id: 'l2',
+      description: '2',
+      bot_name: 'Bot',
+      bridge_token: 't2',
+      group_folder: 'telegram_multi',
+    });
+
+    setActiveCustomerLocation('tg:300', 'l2');
+
+    const active = getActiveCustomerLocation('tg:300');
+    expect(active!.location_id).toBe('l2');
+
+    const all = getCustomerLocations('tg:300');
+    expect(all[0].is_active).toBe(false);
+    expect(all[1].is_active).toBe(true);
+  });
+
+  it('removes a location', () => {
+    addCustomerLocation({
+      chat_jid: 'tg:400',
+      slug: 'rm',
+      business_name: 'Remove Me',
+      location_id: 'rmLoc',
+      description: 'Test',
+      bot_name: 'Bot',
+      bridge_token: 'tok',
+      group_folder: 'telegram_rm',
+    });
+
+    removeCustomerLocation('tg:400', 'rmLoc');
+    expect(getCustomerLocations('tg:400')).toHaveLength(0);
+  });
+
+  it('updates bridge token', () => {
+    addCustomerLocation({
+      chat_jid: 'tg:500',
+      slug: 'upd',
+      business_name: 'Update',
+      location_id: 'updLoc',
+      description: 'Test',
+      bot_name: 'Bot',
+      bridge_token: 'old_tok',
+      group_folder: 'telegram_upd',
+      is_active: true,
+    });
+
+    updateLocationBridgeToken('tg:500', 'updLoc', 'new_tok');
+
+    const active = getActiveCustomerLocation('tg:500');
+    expect(active!.bridge_token).toBe('new_tok');
+  });
+
+  it('counts locations', () => {
+    expect(getCustomerLocationCount('tg:600')).toBe(0);
+
+    addCustomerLocation({
+      chat_jid: 'tg:600',
+      slug: 'cnt',
+      business_name: 'A',
+      location_id: 'a1',
+      description: 'A',
+      bot_name: 'Bot',
+      bridge_token: 'tA',
+      group_folder: 'telegram_cnt',
+    });
+    addCustomerLocation({
+      chat_jid: 'tg:600',
+      slug: 'cnt',
+      business_name: 'B',
+      location_id: 'b1',
+      description: 'B',
+      bot_name: 'Bot',
+      bridge_token: 'tB',
+      group_folder: 'telegram_cnt',
+    });
+
+    expect(getCustomerLocationCount('tg:600')).toBe(2);
+  });
+
+  it('enforces unique chat_jid + location_id', () => {
+    addCustomerLocation({
+      chat_jid: 'tg:700',
+      slug: 'dup',
+      business_name: 'Dup',
+      location_id: 'sameLoc',
+      description: 'First',
+      bot_name: 'Bot',
+      bridge_token: 'tok1',
+      group_folder: 'telegram_dup',
+    });
+
+    expect(() =>
+      addCustomerLocation({
+        chat_jid: 'tg:700',
+        slug: 'dup',
+        business_name: 'Dup2',
+        location_id: 'sameLoc',
+        description: 'Second',
+        bot_name: 'Bot',
+        bridge_token: 'tok2',
+        group_folder: 'telegram_dup',
+      }),
+    ).toThrow();
   });
 });

@@ -6,7 +6,25 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets (API keys, tokens) are NOT read here — they are loaded only
 // by the credential proxy (credential-proxy.ts), never exposed to containers.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'CLAUDE_MODEL',
+  'OPENAI_API_KEY',
+  'OPENAI_MODEL',
+  'OPS_NOTIFY_JID',
+]);
+
+// Expose CLAUDE_MODEL to process.env so container-runner can read it
+if (envConfig.CLAUDE_MODEL && !process.env.CLAUDE_MODEL) {
+  process.env.CLAUDE_MODEL = envConfig.CLAUDE_MODEL;
+}
+if (envConfig.OPENAI_API_KEY && !process.env.OPENAI_API_KEY) {
+  process.env.OPENAI_API_KEY = envConfig.OPENAI_API_KEY;
+}
+if (envConfig.OPENAI_MODEL && !process.env.OPENAI_MODEL) {
+  process.env.OPENAI_MODEL = envConfig.OPENAI_MODEL;
+}
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -71,3 +89,8 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Where to send ops/system notifications (e.g. "Codex escalated to Claude").
+// Format: channel-prefixed JID, e.g. "tg:8590801863". Empty disables ops notifs.
+export const OPS_NOTIFY_JID: string =
+  process.env.OPS_NOTIFY_JID || envConfig.OPS_NOTIFY_JID || '';

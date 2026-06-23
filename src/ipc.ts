@@ -14,6 +14,8 @@ export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
+  setGroupStatus: (jid: string, status: string) => void;
+  unregisterGroup: (jid: string) => void;
   syncGroups: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
@@ -164,6 +166,8 @@ export async function processTaskIpc(
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
+    // For pause_group, resume_group, self_pause, unregister_group
+    status?: string;
     // For register_group
     jid?: string;
     name?: string;
@@ -200,13 +204,27 @@ export async function processTaskIpc(
 
         const targetFolder = targetGroupEntry.folder;
 
-        // Authorization: non-main groups can only schedule for themselves
+        // Authorization: main groups can schedule anywhere; non-main groups
+        // can schedule for themselves OR for any folder listed in the source
+        // group's `allowedTargets` (set at registration by main, used for
+        // paired-group workflows like standup→implementer-exec).
         if (!isMain && targetFolder !== sourceGroup) {
-          logger.warn(
-            { sourceGroup, targetFolder },
-            'Unauthorized schedule_task attempt blocked',
+          const sourceEntry = Object.values(registeredGroups).find(
+            (g) => g.folder === sourceGroup,
           );
-          break;
+          const allowed =
+            sourceEntry?.allowedTargets?.includes(targetFolder) === true;
+          if (!allowed) {
+            logger.warn(
+              { sourceGroup, targetFolder },
+              'Unauthorized schedule_task attempt blocked',
+            );
+            break;
+          }
+          logger.debug(
+            { sourceGroup, targetFolder },
+            'Cross-group schedule_task allowed via allowedTargets',
+          );
         }
 
         const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
@@ -445,6 +463,131 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'pause_group':
+      // Only main group can pause other groups
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized pause_group attempt blocked',
+        );
+        break;
+      }
+      if (data.jid) {
+        const targetGroup = registeredGroups[data.jid];
+        if (targetGroup) {
+          deps.setGroupStatus(data.jid, 'paused');
+          // Write .paused sentinel to group folder
+          const groupDir = path.join(
+            DATA_DIR,
+            '..',
+            'groups',
+            targetGroup.folder,
+          );
+          try {
+            fs.writeFileSync(path.join(groupDir, '.paused'), '');
+          } catch {
+            /* folder may not exist */
+          }
+          logger.info({ jid: data.jid, sourceGroup }, 'Group paused via IPC');
+          // Notify customer
+          if (data.jid !== 'main@g.us') {
+            deps
+              .sendMessage(
+                data.jid,
+                'Your account has been paused. Send "reactivate" to resume, or contact support.',
+              )
+              .catch(() => {});
+          }
+        } else {
+          logger.warn({ jid: data.jid }, 'Cannot pause: group not found');
+        }
+      }
+      break;
+
+    case 'resume_group':
+      // Only main group can resume other groups
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized resume_group attempt blocked',
+        );
+        break;
+      }
+      if (data.jid) {
+        const targetGroup = registeredGroups[data.jid];
+        if (targetGroup) {
+          deps.setGroupStatus(data.jid, 'active');
+          // Remove .paused sentinel
+          const groupDir = path.join(
+            DATA_DIR,
+            '..',
+            'groups',
+            targetGroup.folder,
+          );
+          try {
+            fs.unlinkSync(path.join(groupDir, '.paused'));
+          } catch {
+            /* file may not exist */
+          }
+          logger.info({ jid: data.jid, sourceGroup }, 'Group resumed via IPC');
+          deps
+            .sendMessage(
+              data.jid,
+              'Your account has been reactivated. Welcome back!',
+            )
+            .catch(() => {});
+        } else {
+          logger.warn({ jid: data.jid }, 'Cannot resume: group not found');
+        }
+      }
+      break;
+
+    case 'self_pause':
+      // Any group can pause itself
+      {
+        const selfJid = Object.entries(registeredGroups).find(
+          ([, g]) => g.folder === sourceGroup,
+        )?.[0];
+        if (selfJid) {
+          deps.setGroupStatus(selfJid, 'paused');
+          const groupDir = path.join(DATA_DIR, '..', 'groups', sourceGroup);
+          try {
+            fs.writeFileSync(path.join(groupDir, '.paused'), '');
+          } catch {
+            /* folder may not exist */
+          }
+          logger.info(
+            { jid: selfJid, sourceGroup },
+            'Group self-paused via IPC',
+          );
+          deps
+            .sendMessage(
+              selfJid,
+              'Your account has been paused. Send "reactivate" to resume.',
+            )
+            .catch(() => {});
+        }
+      }
+      break;
+
+    case 'unregister_group':
+      // Only main group can unregister groups
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized unregister_group attempt blocked',
+        );
+        break;
+      }
+      if (data.jid) {
+        deps.unregisterGroup(data.jid);
+        logger.info(
+          { jid: data.jid, sourceGroup },
+          'Group unregistered via IPC',
         );
       }
       break;

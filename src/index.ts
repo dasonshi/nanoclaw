@@ -5,11 +5,12 @@ import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
+  OPS_NOTIFY_JID,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
-import { startCredentialProxy } from './credential-proxy.js';
+import { startCredentialProxy, TokenMap } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -17,7 +18,7 @@ import {
 } from './channels/registry.js';
 import {
   ContainerOutput,
-  runContainerAgent,
+  runContainerWithFallback,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -27,15 +28,21 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  deleteRegisteredGroup,
   getAllChats,
   getAllRegisteredGroups,
+  getAllCustomerCredentials,
+  getCustomerCredential,
+  getOnboardingSession,
   getAllSessions,
   getAllTasks,
+  getSession,
   getMessagesSince,
   getNewMessages,
   getRegisteredGroup,
   getRouterState,
   initDatabase,
+  setGroupStatus,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -45,6 +52,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { createOnboardingHandler } from './onboarding.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   isSenderAllowed,
@@ -66,6 +74,13 @@ let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
+
+// Set in main() once channels are connected. runAgent / scheduler pass this
+// to runContainerWithFallback so a Codex→Claude escalation triggers an
+// operator notification.
+let escalationNotifier:
+  | ((group: RegisteredGroup, reason: string) => Promise<void>)
+  | null = null;
 const queue = new GroupQueue();
 
 function loadState(): void {
@@ -114,6 +129,29 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+function unregisterGroup(jid: string): void {
+  const group = registeredGroups[jid];
+  if (group) {
+    delete registeredGroups[jid];
+    deleteRegisteredGroup(jid);
+    logger.info(
+      { jid, name: group.name, folder: group.folder },
+      'Group unregistered',
+    );
+  }
+}
+
+function updateGroupStatus(jid: string, status: string): void {
+  setGroupStatus(jid, status);
+  // Also update in-memory
+  if (registeredGroups[jid]) {
+    registeredGroups[jid] = {
+      ...registeredGroups[jid],
+      status: status as RegisteredGroup['status'],
+    };
+  }
+}
+
 /**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
@@ -146,6 +184,9 @@ export function _setRegisteredGroups(
 async function processGroupMessages(chatJid: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
   if (!group) return true;
+
+  // Skip paused/suspended groups
+  if (group.status === 'paused' || group.status === 'suspended') return true;
 
   const channel = findChannel(channels, chatJid);
   if (!channel) {
@@ -267,7 +308,12 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  // Read through getSession() (not the in-memory cache) so the 72h staleness
+  // check in db.ts kicks in: idle sessions are pruned and we start fresh.
+  const sessionId = getSession(group.folder);
+  if (!sessionId && sessions[group.folder]) {
+    delete sessions[group.folder]; // keep cache in sync after prune
+  }
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -305,8 +351,13 @@ async function runAgent(
       }
     : undefined;
 
+  const credential = getCustomerCredential(chatJid);
+  const proxyToken = credential?.anthropic_api_key
+    ? credential.proxy_token
+    : undefined;
+
   try {
-    const output = await runContainerAgent(
+    const output = await runContainerWithFallback(
       group,
       {
         prompt,
@@ -315,10 +366,14 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        proxyToken,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      escalationNotifier
+        ? (reason) => escalationNotifier!(group, reason)
+        : undefined,
     );
 
     if (output.newSessionId) {
@@ -380,6 +435,10 @@ async function startMessageLoop(): Promise<void> {
         for (const [chatJid, groupMessages] of messagesByGroup) {
           const group = registeredGroups[chatJid];
           if (!group) continue;
+
+          // Skip paused/suspended groups
+          if (group.status === 'paused' || group.status === 'suspended')
+            continue;
 
           const channel = findChannel(channels, chatJid);
           if (!channel) {
@@ -465,6 +524,116 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+/**
+ * Build the onEscalate callback that fires when the OpenAI runner escalates
+ * to Claude. Sends a Telegram heads-up to OPS_NOTIFY_JID so the operator
+ * knows Anthropic credit is being used and can investigate the underlying
+ * Codex issue. Per-group throttle: at most one notify per group per hour
+ * (a sustained Codex outage would otherwise spam every retry).
+ */
+function makeEscalationNotifier(
+  channels: Channel[],
+): (group: RegisteredGroup, reason: string) => Promise<void> {
+  const ESCALATE_THROTTLE_MS = 60 * 60 * 1000; // 1h
+  const lastNotifyAt = new Map<string, number>();
+  return async (group, reason) => {
+    if (!OPS_NOTIFY_JID) return;
+    const now = Date.now();
+    const last = lastNotifyAt.get(group.folder) ?? 0;
+    if (now - last < ESCALATE_THROTTLE_MS) return;
+    lastNotifyAt.set(group.folder, now);
+    const channel = findChannel(channels, OPS_NOTIFY_JID);
+    if (!channel) {
+      logger.warn(
+        { jid: OPS_NOTIFY_JID },
+        'No channel owns OPS_NOTIFY_JID, cannot send escalation notification',
+      );
+      return;
+    }
+    const trimmed = (reason || 'unknown').slice(0, 200);
+    const text =
+      `⚠️ Codex escalated to Claude for ${group.name}\n` +
+      `Reason: ${trimmed}\n` +
+      `Anthropic credit is now being used. ` +
+      `Check: journalctl -u nanoclaw --since "10min ago"`;
+    try {
+      await channel.sendMessage(OPS_NOTIFY_JID, text);
+    } catch (err) {
+      logger.warn(
+        { err, jid: OPS_NOTIFY_JID },
+        'Failed to send escalation notification',
+      );
+    }
+  };
+}
+
+/**
+ * Channel recovery for unhandled rejections that look like polling / network
+ * errors. Without this, a grammy getUpdates 409 (e.g. another instance racing
+ * the bot token) kills the long-poll loop silently — the process stays
+ * "active" but receives no inbound messages until restart. See the May 14–20
+ * incident: that exact failure mode went undetected for 6 days because the
+ * old handler in src/logger.ts only logged.
+ *
+ * On a matching error we disconnect+reconnect every Telegram channel in
+ * place. If recovery itself throws we exit so systemd restarts cleanly.
+ */
+function installChannelRecoveryHandler(channels: Channel[]): void {
+  let recoveryInProgress = false;
+  process.on('unhandledRejection', async (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    logger.error({ err: reason }, 'Unhandled rejection');
+    if (
+      !/grammy|getUpdates|ETIMEDOUT|ECONNRESET|fetch failed|409|Conflict/i.test(
+        msg,
+      )
+    ) {
+      return;
+    }
+    if (recoveryInProgress) return;
+    recoveryInProgress = true;
+    try {
+      for (const ch of channels) {
+        if (ch.name !== 'telegram') continue;
+        logger.warn(
+          { channel: ch.name },
+          'Polling-class error detected, re-initializing channel',
+        );
+        await ch.disconnect();
+        await new Promise((r) => setTimeout(r, 2000));
+        await ch.connect();
+        logger.info({ channel: ch.name }, 'Channel re-initialized');
+      }
+    } catch (err) {
+      logger.fatal(
+        { err },
+        'Channel recovery failed — exiting for systemd restart',
+      );
+      process.exit(1);
+    } finally {
+      recoveryInProgress = false;
+    }
+  });
+}
+
+class DbTokenMap implements TokenMap {
+  private map = new Map<string, string>();
+  constructor() {
+    this.reload();
+  }
+  reload(): void {
+    this.map.clear();
+    for (const row of getAllCustomerCredentials()) {
+      if (row.anthropic_api_key) {
+        this.map.set(row.proxy_token, row.anthropic_api_key);
+      }
+    }
+  }
+  get(proxyToken: string): string | undefined {
+    return this.map.get(proxyToken);
+  }
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
@@ -472,9 +641,11 @@ async function main(): Promise<void> {
   loadState();
 
   // Start credential proxy (containers route API calls through this)
+  const tokenMap = new DbTokenMap();
   const proxyServer = await startCredentialProxy(
     CREDENTIAL_PROXY_PORT,
     PROXY_BIND_HOST,
+    tokenMap,
   );
 
   // Graceful shutdown handlers
@@ -487,6 +658,19 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Set up onboarding handler
+  const routeOutbound = async (jid: string, text: string) => {
+    const channel = findChannel(channels, jid);
+    if (channel) await channel.sendMessage(jid, text);
+  };
+  const onboarding = createOnboardingHandler({
+    sendMessage: routeOutbound,
+    registerGroup,
+    registeredGroups: () => registeredGroups,
+    setGroupStatus: updateGroupStatus,
+    reloadTokenMap: () => tokenMap.reload(),
+  });
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
@@ -517,6 +701,39 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onOnboardingStart: (jid: string, name: string) =>
+      onboarding.startSession(jid, name),
+    onOnboardingMessage: (jid: string, text: string, name: string) =>
+      onboarding.handleMessage(jid, text, name),
+    isInCommandFlow: (jid: string) => !!getOnboardingSession(jid),
+    onCommand: (jid: string, command: string) => {
+      switch (command) {
+        case 'locations':
+          onboarding.handleLocations(jid);
+          break;
+        case 'connect':
+          onboarding.handleConnect(jid);
+          break;
+        case 'reconnect':
+          onboarding.handleReconnect(jid);
+          break;
+        case 'disconnect':
+          onboarding.handleDisconnect(jid);
+          break;
+        case 'pause':
+          onboarding.handlePause(jid);
+          break;
+        case 'resume':
+          onboarding.handleResume(jid);
+          break;
+        case 'apikey':
+          onboarding.handleApiKey(jid);
+          break;
+        case 'help':
+          onboarding.handleHelp(jid);
+          break;
+      }
+    },
   };
 
   // Create and connect all registered channels.
@@ -540,6 +757,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  installChannelRecoveryHandler(channels);
+  escalationNotifier = makeEscalationNotifier(channels);
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -556,6 +776,9 @@ async function main(): Promise<void> {
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
+    onEscalate: escalationNotifier
+      ? (group, reason) => escalationNotifier!(group, reason)
+      : undefined,
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
@@ -565,6 +788,8 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
+    setGroupStatus: updateGroupStatus,
+    unregisterGroup,
     syncGroups: async (force: boolean) => {
       await Promise.all(
         channels

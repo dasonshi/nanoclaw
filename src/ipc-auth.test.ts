@@ -57,7 +57,14 @@ beforeEach(() => {
     registerGroup: (jid, group) => {
       groups[jid] = group;
       setRegisteredGroup(jid, group);
-      // Mock the fs.mkdirSync that registerGroup does
+    },
+    setGroupStatus: (jid, status) => {
+      if (groups[jid]) {
+        groups[jid] = { ...groups[jid], status: status as any };
+      }
+    },
+    unregisterGroup: (jid) => {
+      delete groups[jid];
     },
     syncGroups: async () => {},
     getAvailableGroups: () => [],
@@ -674,5 +681,99 @@ describe('register_group success', () => {
     );
 
     expect(getRegisteredGroup('partial@g.us')).toBeUndefined();
+  });
+});
+
+// --- pause_group authorization ---
+
+describe('pause_group authorization', () => {
+  it('main group can pause another group', async () => {
+    await processTaskIpc(
+      { type: 'pause_group', jid: 'other@g.us' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    expect(groups['other@g.us'].status).toBe('paused');
+  });
+
+  it('non-main group cannot pause another group', async () => {
+    await processTaskIpc(
+      { type: 'pause_group', jid: 'third@g.us' },
+      'other-group',
+      false,
+      deps,
+    );
+
+    // Status should not have changed
+    expect(groups['third@g.us'].status).toBeUndefined();
+  });
+});
+
+// --- resume_group authorization ---
+
+describe('resume_group authorization', () => {
+  beforeEach(() => {
+    // Pause a group first
+    groups['other@g.us'] = { ...OTHER_GROUP, status: 'paused' };
+  });
+
+  it('main group can resume a paused group', async () => {
+    await processTaskIpc(
+      { type: 'resume_group', jid: 'other@g.us' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    expect(groups['other@g.us'].status).toBe('active');
+  });
+
+  it('non-main group cannot resume another group', async () => {
+    await processTaskIpc(
+      { type: 'resume_group', jid: 'other@g.us' },
+      'third-group',
+      false,
+      deps,
+    );
+
+    expect(groups['other@g.us'].status).toBe('paused');
+  });
+});
+
+// --- self_pause authorization ---
+
+describe('self_pause', () => {
+  it('group can pause itself', async () => {
+    await processTaskIpc({ type: 'self_pause' }, 'other-group', false, deps);
+
+    expect(groups['other@g.us'].status).toBe('paused');
+  });
+});
+
+// --- unregister_group authorization ---
+
+describe('unregister_group authorization', () => {
+  it('main group can unregister another group', async () => {
+    await processTaskIpc(
+      { type: 'unregister_group', jid: 'other@g.us' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    expect(groups['other@g.us']).toBeUndefined();
+  });
+
+  it('non-main group cannot unregister another group', async () => {
+    await processTaskIpc(
+      { type: 'unregister_group', jid: 'third@g.us' },
+      'other-group',
+      false,
+      deps,
+    );
+
+    expect(groups['third@g.us']).toBeDefined();
   });
 });

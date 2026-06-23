@@ -26,12 +26,84 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { getActiveCustomerLocation } from './db.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// True when either an OPENAI_API_KEY is set or the operator has run
+// `codex login` on the host (creating ~/.codex/auth.json). The openai-runner
+// resolves which one to use at startup; here we only need to know whether to
+// route through it at all.
+function hasOpenAIAuth(): boolean {
+  if (process.env.OPENAI_API_KEY) return true;
+  const codexAuth = path.join(
+    process.env.HOME || '/home/nanoclaw',
+    '.codex',
+    'auth.json',
+  );
+  return fs.existsSync(codexAuth);
+}
+
+// ── Codex usage-limit circuit breaker ──────────────────────────────────────
+// When the Codex (ChatGPT-subscription) backend returns `usage_limit_reached`,
+// it includes a `resets_at` epoch. Without acting on it we retry Codex on every
+// request — wasting a ~4s round-trip per call and firing repeated escalation
+// alerts — until the limit lifts (can be days on the Plus plan). Instead we
+// record the reset time, route straight to Claude until then, and auto-resume
+// Codex afterward. Persisted to a file so a service restart doesn't forget the
+// window.
+const CODEX_BLOCK_FILE = path.join(DATA_DIR, 'codex-usage-block.json');
+const CODEX_BLOCK_BUFFER_MS = 60_000; // cushion past resets_at for clock skew
+
+function readCodexBlockedUntil(): number {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CODEX_BLOCK_FILE, 'utf-8')) as {
+      blockedUntil?: number;
+    };
+    return typeof parsed.blockedUntil === 'number' ? parsed.blockedUntil : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeCodexBlockedUntil(blockedUntil: number, resetsAt: number): void {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      CODEX_BLOCK_FILE,
+      JSON.stringify({
+        blockedUntil,
+        resetsAt,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+  } catch (err) {
+    logger.warn({ err }, 'Failed to persist Codex usage-limit block');
+  }
+}
+
+function clearCodexBlock(): void {
+  try {
+    if (fs.existsSync(CODEX_BLOCK_FILE)) fs.rmSync(CODEX_BLOCK_FILE);
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clear Codex usage-limit block');
+  }
+}
+
+// Extract a `resets_at` epoch (seconds) from a usage_limit_reached error.
+// Returns null when the error is not a usage-limit signal.
+function parseUsageLimitResetsAt(error: string | undefined): number | null {
+  if (!error || !error.includes('usage_limit_reached')) return null;
+  const at = error.match(/"resets_at"\s*:\s*(\d+)/);
+  if (at) return parseInt(at[1], 10);
+  const inSec = error.match(/"resets_in_seconds"\s*:\s*(\d+)/);
+  if (inSec) return Math.floor(Date.now() / 1000) + parseInt(inSec[1], 10);
+  return Math.floor(Date.now() / 1000) + 3600; // usage-limited, no time → back off 1h
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -41,10 +113,11 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  proxyToken?: string;
 }
 
 export interface ContainerOutput {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'escalate';
   result: string | null;
   newSessionId?: string;
   error?: string;
@@ -94,12 +167,33 @@ function buildVolumeMounts(
       readonly: false,
     });
   } else {
-    // Other groups only get their own folder
+    // Non-main groups: their own folder + project root (read-only).
+    // Project root mount lets the OpenAI runner's Skill loader find
+    // skills at /workspace/project/container/skills/<name>/SKILL.md and
+    // lets skills reference shared CONTEXT.md files there. Read-only +
+    // .env shadowed so non-main groups can't modify host code or read
+    // secrets — same posture as main, just without the writable group
+    // folder being the project root.
     mounts.push({
       hostPath: groupDir,
       containerPath: '/workspace/group',
       readonly: false,
     });
+
+    mounts.push({
+      hostPath: projectRoot,
+      containerPath: '/workspace/project',
+      readonly: true,
+    });
+
+    const envFile = path.join(projectRoot, '.env');
+    if (fs.existsSync(envFile)) {
+      mounts.push({
+        hostPath: '/dev/null',
+        containerPath: '/workspace/project/.env',
+        readonly: true,
+      });
+    }
 
     // Global memory directory (read-only for non-main)
     // Only directory mounts are supported, not file mounts
@@ -163,6 +257,22 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount ~/.codex (Codex CLI OAuth credentials) when present on the host.
+  // The openai-runner reads tokens from auth.json and refreshes them in place,
+  // so this must be writable. Shared across groups by design — one ChatGPT
+  // identity for the whole NanoClaw install, mirroring `codex login` semantics.
+  const hostCodexDir = path.join(
+    process.env.HOME || '/home/nanoclaw',
+    '.codex',
+  );
+  if (fs.existsSync(path.join(hostCodexDir, 'auth.json'))) {
+    mounts.push({
+      hostPath: hostCodexDir,
+      containerPath: '/home/node/.codex',
+      readonly: false,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -199,6 +309,45 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount bridge-call script (read-only) so agents can call the GHL bridge
+  // without needing auth tokens in their prompt context
+  const bridgeCallScript = path.join(
+    process.env.HOME || '/Users/davidsonshine',
+    '.openclaw',
+    'hylo-bridge',
+    'bridge-call.sh',
+  );
+  if (fs.existsSync(bridgeCallScript)) {
+    mounts.push({
+      hostPath: bridgeCallScript,
+      containerPath: '/usr/local/bin/bridge-call',
+      readonly: true,
+    });
+  }
+
+  // Mount ai-news-mcp source (read-only) and DB directory (read-write for SQLite journal/WAL).
+  // node_modules is baked into the container image (native modules need matching Node version).
+  const aiNewsMcpDir = '/opt/ai-news-mcp';
+  const aiNewsDbDir = '/opt/ai-news-mcp/db';
+  if (fs.existsSync(aiNewsMcpDir)) {
+    const indexFile = path.join(aiNewsMcpDir, 'index.js');
+    if (fs.existsSync(indexFile)) {
+      mounts.push({
+        hostPath: indexFile,
+        containerPath: '/opt/ai-news-mcp/index.js',
+        readonly: true,
+      });
+    }
+    // Mount the db directory (writable so SQLite can create journal/wal files)
+    if (fs.existsSync(aiNewsDbDir)) {
+      mounts.push({
+        hostPath: aiNewsDbDir,
+        containerPath: '/opt/ai-news-mcp/db',
+        readonly: false,
+      });
+    }
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -212,14 +361,70 @@ function buildVolumeMounts(
   return mounts;
 }
 
+/**
+ * Look up a PIT (access_token) from profiles.yaml by bridge_token.
+ */
+function lookupPitToken(bridgeToken: string): string | null {
+  const profilesPath = path.join(
+    process.env.HOME || '/home/nanoclaw',
+    '.ghl',
+    'profiles.yaml',
+  );
+  try {
+    const content = fs.readFileSync(profilesPath, 'utf-8');
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (
+        lines[i].includes(`bridge_token:`) &&
+        lines[i].includes(bridgeToken)
+      ) {
+        // Walk backwards to find access_token
+        for (let j = i - 1; j >= 0 && j >= i - 5; j--) {
+          const match = lines[j].match(/access_token:\s*"?([^"\s]+)"?/);
+          if (match) return match[1];
+        }
+      }
+    }
+  } catch {
+    logger.warn('Failed to read profiles.yaml for PIT lookup');
+  }
+  return null;
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  proxyToken?: string,
+  extraEnv?: Record<string, string>,
+  runner: 'openai' | 'claude' = 'openai',
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Select which runner the container uses
+  args.push('-e', `RUNNER=${runner}`);
+
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // OpenAI runner: pass through API key if set, plus the model override.
+  // The runner itself decides between OAuth (~/.codex/auth.json) and API-key
+  // auth at runtime; we just forward whatever's available.
+  if (runner === 'openai') {
+    if (process.env.OPENAI_API_KEY) {
+      args.push('-e', `OPENAI_API_KEY=${process.env.OPENAI_API_KEY}`);
+    }
+    if (process.env.OPENAI_MODEL) {
+      args.push('-e', `OPENAI_MODEL=${process.env.OPENAI_MODEL}`);
+    }
+    // Reasoning effort for gpt-5/o-series. Runner defaults to 'high' if unset;
+    // override here (e.g. 'medium') without rebuilding the container image.
+    if (process.env.OPENAI_REASONING_EFFORT) {
+      args.push(
+        '-e',
+        `OPENAI_REASONING_EFFORT=${process.env.OPENAI_REASONING_EFFORT}`,
+      );
+    }
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
@@ -227,15 +432,28 @@ function buildContainerArgs(
     `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
   );
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  // Force model selection via environment (default: claude-sonnet-4-6)
+  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+  args.push('-e', `CLAUDE_MODEL=${model}`);
+
+  // Pass Hylo API key for hylo-mcp inside containers
+  if (process.env.HYLO_API_KEY) {
+    args.push('-e', `HYLO_API_KEY=${process.env.HYLO_API_KEY}`);
+  }
+
+  // Auth mode for this container:
+  // - If customer has their own API key (proxyToken set), always use API key mode
+  //   so the SDK sends x-api-key which the proxy resolves to their real key.
+  // - Otherwise, mirror the operator's auth method with a placeholder value.
+  if (proxyToken) {
+    args.push('-e', `ANTHROPIC_API_KEY=${proxyToken}`);
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
@@ -249,6 +467,13 @@ function buildContainerArgs(
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
+  }
+
+  // Per-customer env vars (e.g. GHL credentials for hylo-mcp)
+  if (extraEnv) {
+    for (const [key, value] of Object.entries(extraEnv)) {
+      if (value) args.push('-e', `${key}=${value}`);
+    }
   }
 
   for (const mount of mounts) {
@@ -269,6 +494,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  runner: 'openai' | 'claude' = hasOpenAIAuth() ? 'openai' : 'claude',
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -278,7 +504,65 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+
+  // Look up customer's GHL credentials for hylo-mcp
+  const extraEnv: Record<string, string> = {};
+  const activeLocation = getActiveCustomerLocation(input.chatJid);
+  if (activeLocation) {
+    extraEnv.GHL_LOCATION_ID = activeLocation.location_id;
+    // Read PIT token from the group's .bridge-token → look up in profiles.yaml
+    const bridgeTokenPath = path.join(groupDir, '.bridge-token');
+    if (fs.existsSync(bridgeTokenPath)) {
+      const bridgeToken = fs.readFileSync(bridgeTokenPath, 'utf-8').trim();
+      const pitToken = lookupPitToken(bridgeToken);
+      if (pitToken) extraEnv.GHL_PIT_TOKEN = pitToken;
+    }
+  }
+
+  // Per-group env overrides from containerConfig.env. Allowlist-gated:
+  // only OPENAI_*, ROUTEAWARE_*, and HYLO_* are accepted. The point of this
+  // gate is that group config is set by main-group operators through
+  // register_group, and we don't want it to become a generic injection surface
+  // for arbitrary process env. Bump the allowlist regex below when adding a
+  // new prefix.
+  const PER_GROUP_ENV_ALLOW_RE = /^(OPENAI|ROUTEAWARE|HYLO)_[A-Z0-9_]+$/;
+  if (group.containerConfig?.env) {
+    for (const [key, value] of Object.entries(group.containerConfig.env)) {
+      if (!PER_GROUP_ENV_ALLOW_RE.test(key)) {
+        logger.warn(
+          { group: group.name, key },
+          'Per-group env key rejected (allowlist mismatch)',
+        );
+        continue;
+      }
+      // Sentinel: "$PROCESS_ENV" means look up the value from the
+      // nanoclaw process's environment at runtime. Lets us keep secrets out
+      // of the DB while still scoping them per-group. The key must already
+      // be in process.env (loaded via systemd EnvironmentFile=) — if missing,
+      // we skip rather than passing an empty string, so misconfig is loud.
+      if (value === '$PROCESS_ENV') {
+        const fromProcess = process.env[key];
+        if (!fromProcess) {
+          logger.warn(
+            { group: group.name, key },
+            'Per-group env $PROCESS_ENV sentinel: process.env key is unset',
+          );
+          continue;
+        }
+        extraEnv[key] = fromProcess;
+      } else {
+        extraEnv[key] = value;
+      }
+    }
+  }
+
+  const containerArgs = buildContainerArgs(
+    mounts,
+    containerName,
+    input.proxyToken,
+    extraEnv,
+    runner,
+  );
 
   logger.debug(
     {
@@ -439,6 +723,10 @@ export async function runContainerAgent(
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
+        // Without the stderr/stdout tail we couldn't diagnose the May 17–18
+        // Mac-instance hangs — the runner had been logging actively to stderr
+        // but the timeout dump was 7 header lines and nothing else. Include
+        // the captured buffers + spawn args so silent hangs are debuggable.
         fs.writeFileSync(
           timeoutLog,
           [
@@ -449,6 +737,15 @@ export async function runContainerAgent(
             `Duration: ${duration}ms`,
             `Exit Code: ${code}`,
             `Had Streaming Output: ${hadStreamingOutput}`,
+            ``,
+            `=== Container Args ===`,
+            containerArgs.join(' '),
+            ``,
+            `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
+            stderr || '(empty)',
+            ``,
+            `=== Stdout tail (last 4KB${stdoutTruncated ? ', overall TRUNCATED' : ''}) ===`,
+            stdout.slice(-4096) || '(empty)',
           ].join('\n'),
         );
 
@@ -640,6 +937,128 @@ export async function runContainerAgent(
       });
     });
   });
+}
+
+/**
+ * Run container with automatic OpenAI → Claude fallback.
+ * Tries OpenAI first (if OPENAI_API_KEY or Codex OAuth is set). If the
+ * runner's first output is 'escalate', kill the OpenAI container and retry
+ * with the Claude SDK runner.
+ *
+ * Implementation note: both runners stay alive after each query to receive
+ * IPC follow-ups, so we MUST stream-parse output. With onOutput omitted, the
+ * host would only resolve at container exit — which never happens for these
+ * long-lived runners.
+ */
+export async function runContainerWithFallback(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+  onEscalate?: (reason: string) => Promise<void>,
+): Promise<ContainerOutput> {
+  if (!hasOpenAIAuth()) {
+    return runContainerAgent(group, input, onProcess, onOutput, 'claude');
+  }
+
+  // Circuit breaker: if Codex is in a known usage-limit window, skip the OpenAI
+  // round-trip entirely and route straight to Claude. Auto-resume once it lifts.
+  const codexBlockedUntil = readCodexBlockedUntil();
+  if (codexBlockedUntil > Date.now()) {
+    logger.info(
+      { group: group.name, until: new Date(codexBlockedUntil).toISOString() },
+      'Codex usage limit active — routing to Claude, skipping OpenAI',
+    );
+    return runContainerAgent(group, input, onProcess, onOutput, 'claude');
+  }
+  if (codexBlockedUntil > 0) {
+    clearCodexBlock();
+    logger.info(
+      { group: group.name },
+      'Codex usage-limit window elapsed — resuming OpenAI runner',
+    );
+  }
+
+  logger.info({ group: group.name }, 'Trying OpenAI runner');
+
+  let escalated = false;
+  let firstSeen = false;
+  let openaiProcess: ChildProcess | null = null;
+
+  const fireEscalate = async (reason: string | undefined): Promise<void> => {
+    // If this escalation is a Codex usage-limit, trip the circuit breaker so
+    // subsequent requests skip Codex until it resets, and enrich the alert.
+    // Done before the onEscalate guard so the breaker trips even with no notifier.
+    let alertReason = reason;
+    const resetsAtSec = parseUsageLimitResetsAt(reason);
+    if (resetsAtSec) {
+      const until = resetsAtSec * 1000 + CODEX_BLOCK_BUFFER_MS;
+      writeCodexBlockedUntil(until, resetsAtSec);
+      const untilStr = new Date(until).toISOString();
+      logger.info(
+        { group: group.name, until: untilStr },
+        'Codex usage limit reached — pausing OpenAI runner until reset',
+      );
+      alertReason = `Codex usage limit reached — pausing Codex until ${untilStr}; running on Claude until then.`;
+    }
+    if (!onEscalate) return;
+    try {
+      await onEscalate(alertReason || 'unknown');
+    } catch (err) {
+      logger.warn({ err }, 'onEscalate notifier threw');
+    }
+  };
+
+  const wrappedOnProcess = (proc: ChildProcess, containerName: string) => {
+    openaiProcess = proc;
+    onProcess(proc, containerName);
+  };
+
+  const wrappedOnOutput = async (out: ContainerOutput): Promise<void> => {
+    if (!firstSeen) {
+      firstSeen = true;
+      if (out.status === 'escalate') {
+        escalated = true;
+        logger.info(
+          { group: group.name, reason: out.error },
+          'OpenAI runner escalated on first output, killing and falling back to Claude',
+        );
+        if (openaiProcess) {
+          try {
+            openaiProcess.kill('SIGTERM');
+          } catch {
+            /* ignore */
+          }
+        }
+        await fireEscalate(out.error);
+        return;
+      }
+    }
+    if (!escalated && onOutput) await onOutput(out);
+  };
+
+  const openaiResult = await runContainerAgent(
+    group,
+    input,
+    wrappedOnProcess,
+    wrappedOnOutput,
+    'openai',
+  );
+
+  // Escalate path is detected via the wrapped output handler above OR via the
+  // final result if the runner exited before emitting any streaming output
+  // (e.g. immediate auth failure before the loop runs).
+  if (escalated || openaiResult.status === 'escalate') {
+    logger.info(
+      { group: group.name, reason: openaiResult.error },
+      'OpenAI runner escalated, falling back to Claude',
+    );
+    // Only fire here if we didn't already fire from the streaming path
+    if (!escalated) await fireEscalate(openaiResult.error);
+    return runContainerAgent(group, input, onProcess, onOutput, 'claude');
+  }
+
+  return openaiResult;
 }
 
 export function writeTasksSnapshot(
