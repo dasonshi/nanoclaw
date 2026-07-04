@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Hylo post-deploy verify gate every 30 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+Unit=hylo-post-deploy-gate.service
+
+[Install]
+WantedBy=timers.target

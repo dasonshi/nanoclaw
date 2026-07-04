@@ -1,0 +1,12 @@
+[Unit]
+Description=Hylo post-deploy verify gate (enqueue agent only on merged auto-draft PRs)
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/nanoclaw/hylo-monitor.env
+ExecStart=/usr/local/bin/hylo-post-deploy-gate
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hylo-post-deploy-gate

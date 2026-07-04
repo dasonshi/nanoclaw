@@ -17,11 +17,16 @@ install -m 0755 "${SRC_DIR}/nanoclaw-healthcheck.sh" /usr/local/bin/nanoclaw-hea
 echo "Installing codex-token-refresh script to /usr/local/bin/"
 install -m 0755 "${SRC_DIR}/codex-token-refresh" /usr/local/bin/codex-token-refresh
 
+echo "Installing hylo-post-deploy-gate script to /usr/local/bin/"
+install -m 0755 "${SRC_DIR}/hylo-post-deploy-gate.sh" /usr/local/bin/hylo-post-deploy-gate
+
 echo "Installing systemd units to /etc/systemd/system/"
 install -m 0644 "${SRC_DIR}/nanoclaw-healthcheck.service" /etc/systemd/system/
 install -m 0644 "${SRC_DIR}/nanoclaw-healthcheck.timer" /etc/systemd/system/
 install -m 0644 "${SRC_DIR}/codex-token-refresh.service" /etc/systemd/system/
 install -m 0644 "${SRC_DIR}/codex-token-refresh.timer" /etc/systemd/system/
+install -m 0644 "${SRC_DIR}/hylo-post-deploy-gate.service" /etc/systemd/system/
+install -m 0644 "${SRC_DIR}/hylo-post-deploy-gate.timer" /etc/systemd/system/
 
 echo "Reloading systemd"
 systemctl daemon-reload
@@ -29,6 +34,7 @@ systemctl daemon-reload
 echo "Enabling and starting timers"
 systemctl enable --now nanoclaw-healthcheck.timer
 systemctl enable --now codex-token-refresh.timer
+systemctl enable --now hylo-post-deploy-gate.timer
 
 echo
 echo "Done. Verify with:"
