@@ -40,17 +40,52 @@ SINCE=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
   || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
 
 # Single GitHub search: merged auto-draft PRs since SINCE. No model, no cost.
-RESP=$(curl -sS --max-time 20 -G "https://api.github.com/search/issues" \
+# Capture the HTTP status SEPARATELY (appended as the final line via -w) so an
+# auth/rate-limit/5xx failure is NOT mistaken for "no PR merged" — otherwise a
+# revoked HYLO_GH_PAT collapses into the same silent exit-0 path and the gate
+# stops enqueuing forever, unnoticed (the highest-severity failure mode here).
+RAW=$(curl -sS --max-time 20 -w '\n%{http_code}' -G "https://api.github.com/search/issues" \
   --data-urlencode "q=repo:${REPO} is:pr is:merged label:auto-draft merged:>=${SINCE}" \
   --data-urlencode "per_page=50" \
   -H "Authorization: Bearer ${HYLO_GH_PAT}" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" || true)
+HTTP_CODE=$(printf '%s' "${RAW}" | tail -n1)
+RESP=$(printf '%s' "${RAW}" | sed '$d')
 
-if [[ -z "${RESP}" ]]; then
-  logger -t hylo-post-deploy-gate "GitHub API unreachable, skipping tick"
-  exit 0
-fi
+case "${HTTP_CODE}" in
+  2*) : ;;  # OK — fall through to parse
+  ''|000)
+    # No HTTP status = network/DNS/timeout. Transient; mirror the healthcheck's
+    # "unreachable → skip" (no alert, retry next tick).
+    logger -t hylo-post-deploy-gate "GitHub API unreachable (no HTTP status), skipping tick"
+    exit 0 ;;
+  *)
+    # Non-2xx WITH a response: bad/expired PAT (401/403), rate limit (403/429),
+    # or server error (5xx). Detection is broken, NOT "no PR merged". Log loudly,
+    # send a throttled (1/hour) Telegram alert, and exit non-zero so systemd also
+    # flags the unit as failed. Mirrors nanoclaw-healthcheck.sh Check 2.
+    logger -t hylo-post-deploy-gate "GitHub search failed (HTTP ${HTTP_CODE}) — auto-draft PR verification is down until fixed"
+    ALERT_TS_FILE="${STATE_DIR}/api_alert_ts"
+    NOW=$(date +%s); LAST=0
+    [[ -r "${ALERT_TS_FILE}" ]] && { LAST=$(cat "${ALERT_TS_FILE}" 2>/dev/null); LAST=${LAST:-0}; }
+    if (( NOW - LAST >= 3600 )); then
+      TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+      CHAT_ID="${OPS_NOTIFY_JID:-}"; CHAT_ID=${CHAT_ID#tg:}
+      if [[ -n "${TOKEN}" && -n "${CHAT_ID}" ]]; then
+        MSG="⚠️ NanoClaw: hylo-post-deploy-gate GitHub search failed (HTTP ${HTTP_CODE}). Auto-draft PR verification is paused — check HYLO_GH_PAT in /etc/nanoclaw/hylo-monitor.env (likely expired/revoked)."
+        curl -sS --max-time 10 "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+          --data-urlencode "chat_id=${CHAT_ID}" \
+          --data-urlencode "text=${MSG}" >/dev/null || true
+        echo "${NOW}" > "${ALERT_TS_FILE}"
+      fi
+    fi
+    exit 1 ;;
+esac
+
+# API healthy — clear any stale alert throttle so the next real failure alerts
+# immediately instead of being suppressed by an old timestamp.
+rm -f "${STATE_DIR}/api_alert_ts" 2>/dev/null || true
 
 # Extract PR numbers (one per line). On API error (no .items) prints nothing.
 # python3 -c (not a heredoc) — a heredoc inside $(...) with a trailing `|| true`

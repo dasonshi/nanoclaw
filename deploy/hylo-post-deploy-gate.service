@@ -4,6 +4,10 @@ After=network.target
 
 [Service]
 Type=oneshot
+# /opt/nanoclaw/.env (optional) supplies TELEGRAM_BOT_TOKEN + OPS_NOTIFY_JID for
+# the GitHub-API-failure alert; hylo-monitor.env supplies HYLO_GH_PAT. No key
+# overlap between the two.
+EnvironmentFile=-/opt/nanoclaw/.env
 EnvironmentFile=/etc/nanoclaw/hylo-monitor.env
 ExecStart=/usr/local/bin/hylo-post-deploy-gate
 User=root
