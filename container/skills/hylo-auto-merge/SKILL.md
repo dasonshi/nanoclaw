@@ -95,7 +95,7 @@ done
 #    and no deleted files. new_dependency/schema_change are structurally covered
 #    here — deps (pyproject.toml, requirements*, package*.json) and migrations
 #    (supabase/migrations/) live OUTSIDE api/,tests/ so are rejected by this gate.
-ALWAYS_HUMAN=$(jq -r '.always_human[]' "$AP")
+ALWAYS_HUMAN=$(jq -r '.always_human[]' "$AP") || hold "cannot read always_human list (config malformed)"
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   case "$f" in api/core/config.py) hold "touches always_human: $f";; api/*|tests/*) : ;; *) hold "out-of-scope path: $f";; esac
@@ -205,9 +205,13 @@ else
     # HELD_LIST += "#$PR — deferred (cap $MAX reached)"
   else
     gh pr ready "$PR" --repo "$REPO" 2>/dev/null || true
-    if gh pr merge "$PR" --repo "$REPO" --squash --delete-branch 2>"$SCRATCH/merge-$PR.err"; then
+    # --match-head-commit pins the merge to the exact SHA we reviewed+gated. If a
+    # new (unreviewed) commit landed between the sentinel check and here, GitHub
+    # rejects the merge (422) rather than silently shipping it — caught below as
+    # an escalation. Closes the TOCTOU window.
+    if gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$CUR_SHA" 2>"$SCRATCH/merge-$PR.err"; then
       echo $((DONE+1)) > "$SCRATCH/merged_count"
-      ISSUE=$(grep -oiE 'Closes #[0-9]+' "$SCRATCH/pr-$PR.meta" | grep -oE '[0-9]+' | head -1)
+      ISSUE=$(grep -oiE '(closes|fixes|resolves) #[0-9]+' "$SCRATCH/pr-$PR.meta" | grep -oE '[0-9]+' | head -1)
       NOW=$(date -u +%FT%TZ)
       echo "{\"issue_number\": ${ISSUE:-null}, \"pr_number\": $PR, \"status\": \"merged\", \"merged_at\": \"$NOW\", \"by\": \"hylo-auto-merge\"}" >> "$MEM/known-issues.jsonl"
       echo "$(date -u +%F)	auto_merged	PR #$PR${ISSUE:+ (issue #$ISSUE)} — CI green, reviewed, self-audited" >> "$MEM/delta-log.md"
