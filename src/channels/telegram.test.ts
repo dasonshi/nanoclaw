@@ -69,7 +69,11 @@ vi.mock('grammy', () => ({
   },
 }));
 
-import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import {
+  TelegramChannel,
+  TelegramChannelOpts,
+  escapeIntraWordUnderscores,
+} from './telegram.js';
 
 // --- Test helpers ---
 
@@ -785,6 +789,82 @@ describe('TelegramChannel', () => {
       await channel.sendMessage('tg:100200300', 'No bot');
 
       // No error, no API call
+    });
+  });
+
+  // --- Markdown underscore escaping ---
+
+  describe('escapeIntraWordUnderscores', () => {
+    it('escapes underscores inside identifiers', () => {
+      expect(escapeIntraWordUnderscores('HYLO_GH_PAT')).toBe('HYLO\\_GH\\_PAT');
+    });
+
+    it('leaves italic delimiters alone', () => {
+      expect(escapeIntraWordUnderscores('an _italic_ word')).toBe(
+        'an _italic_ word',
+      );
+    });
+
+    it('escapes consecutive underscores', () => {
+      expect(escapeIntraWordUnderscores('a__b')).toBe('a\\_\\_b');
+    });
+
+    it('does not touch inline code spans', () => {
+      expect(escapeIntraWordUnderscores('use `HYLO_GH_PAT` here')).toBe(
+        'use `HYLO_GH_PAT` here',
+      );
+    });
+
+    it('does not touch fenced code blocks', () => {
+      const text = 'run:\n```\nexport GH_TOKEN=$HYLO_GH_PAT\n```\ndone';
+      expect(escapeIntraWordUnderscores(text)).toBe(text);
+    });
+
+    it('escapes outside a code span but not inside it', () => {
+      expect(escapeIntraWordUnderscores('set chat_jid via `chat_jid`')).toBe(
+        'set chat\\_jid via `chat_jid`',
+      );
+    });
+
+    it('leaves text without underscores unchanged', () => {
+      expect(escapeIntraWordUnderscores('plain message')).toBe('plain message');
+    });
+  });
+
+  describe('sendMessage markdown escaping', () => {
+    it('sends identifiers intact instead of letting Telegram italicise them', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendMessage(
+        'tg:100200300',
+        'GitHub API returned 401 Bad credentials for HYLO_GH_PAT.',
+      );
+
+      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
+        '100200300',
+        'GitHub API returned 401 Bad credentials for HYLO\\_GH\\_PAT.',
+        { parse_mode: 'Markdown' },
+      );
+    });
+
+    it('falls back to the raw text, unescaped, when Markdown is rejected', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.sendMessage.mockRejectedValueOnce(
+        new Error("Bad Request: can't parse entities"),
+      );
+
+      await channel.sendMessage('tg:100200300', 'stray _ and HYLO_GH_PAT');
+
+      expect(currentBot().api.sendMessage).toHaveBeenLastCalledWith(
+        '100200300',
+        'stray _ and HYLO_GH_PAT',
+        {},
+      );
     });
   });
 

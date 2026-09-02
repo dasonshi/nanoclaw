@@ -19,6 +19,31 @@ export interface TelegramChannelOpts {
 }
 
 /**
+ * Escape intra-word underscores so identifiers survive Telegram's Markdown v1
+ * parser.
+ *
+ * Telegram v1 Markdown reads `_..._` as italic. An identifier like
+ * `HYLO_GH_PAT` contains a balanced pair, so the API accepts the message —
+ * no error, so the plain-text fallback below never fires — and silently
+ * renders "HYLOGHPAT", a name that exists nowhere. That makes error reports
+ * naming snake_case identifiers actively misleading.
+ *
+ * An underscore with a word character on both sides is never an intentional
+ * italic delimiter, so escape those and leave real `_italic_` markers alone.
+ * Code spans are skipped: Telegram does not parse markdown inside them, and a
+ * backslash there would render literally.
+ */
+export function escapeIntraWordUnderscores(text: string): string {
+  // Capture group keeps the delimiters, so odd indices are the code spans.
+  return text
+    .split(/(```[\s\S]*?```|`[^`\n]*`)/g)
+    .map((segment, i) =>
+      i % 2 === 1 ? segment : segment.replace(/(?<=\w)_(?=\w)/g, '\\_'),
+    )
+    .join('');
+}
+
+/**
  * Send a message with Telegram Markdown parse mode, falling back to plain text.
  * Claude's output naturally matches Telegram's Markdown v1 format:
  *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
@@ -30,12 +55,12 @@ async function sendTelegramMessage(
   options: { message_thread_id?: number } = {},
 ): Promise<void> {
   try {
-    await api.sendMessage(chatId, text, {
+    await api.sendMessage(chatId, escapeIntraWordUnderscores(text), {
       ...options,
       parse_mode: 'Markdown',
     });
   } catch (err) {
-    // Fallback: send as plain text if Markdown parsing fails
+    // Fallback: send the raw text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
     await api.sendMessage(chatId, text, options);
   }
